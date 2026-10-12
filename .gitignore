@@ -30,8 +30,16 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
-.env*
+# local environment files and secrets
+# Keep .env.example as the documented, safe-to-commit template.
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env*.local
+.env*.secret
+!.env.example
 
 # vercel
 .vercel
@@ -39,3 +47,18 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local tooling, editor state, and generated artifacts
+.turbo/
+.eslintcache
+.cache/
+.idea/
+.vscode/
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# private presentation build and validation artifacts
+.deck-build/
+.codex-finalizer/
