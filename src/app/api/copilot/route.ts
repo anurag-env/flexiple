@@ -2,37 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { retrieveContext, formatContextForPrompt } from '@/lib/retrieval';
 
-const SYSTEM_PROMPT = `You are the GCC Atlas Research Copilot — an evidence-grounded AI research assistant helping international companies research, evaluate, and plan Global Capability Centres (GCCs) in India.
+const SYSTEM_PROMPT = `You are the GCC Atlas Research Copilot for evaluating Global Capability Centres (GCCs) in India.
 
-CRITICAL OPERATIONAL RULES:
-1. STRICT CURATED DATASET GROUNDING:
-   - You ONLY answer based on the retrieved evidence provided from the GCC Atlas curated dataset.
-   - You DO NOT search the live internet or browse live websites. NEVER claim or imply you performed live web searches or real-time verification.
-2. SCOPE:
-   - You only answer questions related to GCCs in India, city evaluation (Bengaluru, Hyderabad, Pune), engineering talent, real estate, costs, and state government policies.
-   - If a question is outside this domain, politely state that it is beyond GCC Atlas's scope.
-3. EVIDENCE REQUIREMENTS FOR POLICIES, INCENTIVES & METRICS:
-   - Specific policy claims, incentive amounts, tax exemptions, subsidies, targets, dates, and deadlines REQUIRE evidence.
-   - You MUST cite the supporting source ID for every claim (e.g., [src-005] for Karnataka GCC Policy, [src-006] for Telangana IT Policy).
-   - NEVER invent or extrapolate incentive amounts, subsidies, or tax figures that are not explicitly documented in the retrieved evidence.
-4. RIGOROUS INFORMATION CLASSIFICATION:
-   Every comprehensive answer must explicitly distinguish between:
-   - VERIFIED FACTS: Information directly established and confirmed by the provided evidence sources (cite source IDs, e.g., [src-005]).
-   - ESTIMATES: Directional metrics, scores, or approximate figures derived from reports.
-   - ASSUMPTIONS: Plausible conclusions that lack direct empirical evidence in the dataset.
-   - UNKNOWNS / GAPS: Relevant information that is NOT present in the dataset.
-5. EXPLICIT ACKNOWLEDGEMENT OF GAPS:
-   - When the available dataset does not support a claim, or lacks data for a city, company, metric, or policy, you MUST EXPLICITLY state that the GCC Atlas dataset does not contain this information.
-   - NEVER invent or extrapolate facts to fill gaps. State what is known versus unknown, and suggest what specific investigation the user should perform independently.
-6. INDEPENDENT VERIFICATION HONESTY:
-   - Do NOT claim that information was independently verified unless the provided evidence source notes explicitly state that independent verification was conducted.
-7. CITATION INTEGRITY:
-   - ONLY cite source IDs that exist in the provided evidence context (e.g., [src-001], [src-005]).
-   - NEVER invent imaginary source IDs.
-   - Use clean inline citations like [src-005].
-8. FORMATTING:
-   - Format responses using clean Markdown with headings (##, ###), bullet points, and bold text.
-   - Do NOT output raw HTML tags.`;
+Answer only from the retrieved GCC Atlas evidence. Never claim live browsing or independent real-time verification. Keep answers concise and decision-useful. Cite every factual policy, incentive, metric, date, or company claim using only source IDs present in the supplied context (for example, [src-005]). Do not invent figures, sources, or details. When the dataset is incomplete, say what is unknown and suggest the next validation step. If useful, distinguish verified facts from directional estimates or assumptions. Stay within Indian GCCs, city evaluation, talent, real estate, costs, and state policies. Use clean Markdown; never raw HTML.`;
 
 // Practical in-memory sliding-window rate limiter for single-instance protection.
 // NOTE: For multi-instance / serverless production (e.g. Vercel Serverless / Edge),
@@ -44,8 +16,68 @@ interface RateLimitRecord {
 }
 
 const rateLimitStore = new Map<string, RateLimitRecord>();
+const responseCache = new Map<string, { expiresAt: number; response: string }>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1-minute window
 const MAX_REQUESTS_PER_WINDOW = 20; // 20 requests per minute per IP
+const RESPONSE_CACHE_TTL_MS = 3 * 60 * 1000;
+const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
+let availableModelCache: { expiresAt: number; models: string[] } | null = null;
+
+const STATIC_MODEL_FALLBACKS = [
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-flash-latest',
+];
+
+function normalizeModelName(name: string): string {
+  return name.replace(/^models\//, '');
+}
+
+function isTextGenerationModel(name: string): boolean {
+  const normalized = name.toLowerCase();
+  return normalized.includes('flash') && !/(image|audio|tts|live|embedding)/.test(normalized);
+}
+
+function modelPreference(name: string): number {
+  if (name.includes('2.5-flash-lite')) return 0;
+  if (name.includes('flash-lite')) return 1;
+  if (name.includes('2.5-flash')) return 2;
+  return 3;
+}
+
+async function getAvailableModels(apiKey: string): Promise<string[]> {
+  if (availableModelCache && availableModelCache.expiresAt > Date.now()) {
+    return availableModelCache.models;
+  }
+
+  try {
+    const response = await withTimeout(
+      fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+        headers: { 'x-goog-api-key': apiKey },
+      }),
+      5000,
+      'Gemini model discovery timed out'
+    );
+    if (!response.ok) throw new Error(`Gemini model discovery returned ${response.status}`);
+
+    const payload = await response.json() as {
+      models?: { name?: string; supportedGenerationMethods?: string[] }[];
+    };
+    const models = (payload.models ?? [])
+      .filter(model => model.name && model.supportedGenerationMethods?.includes('generateContent'))
+      .map(model => normalizeModelName(model.name!))
+      .filter(isTextGenerationModel)
+      .sort((a, b) => modelPreference(a) - modelPreference(b));
+
+    if (models.length > 0) {
+      availableModelCache = { models, expiresAt: Date.now() + MODEL_CACHE_TTL_MS };
+    }
+    return models;
+  } catch (error) {
+    console.warn('Gemini model discovery was unavailable:', error instanceof Error ? error.message : 'Unknown error');
+    return [];
+  }
+}
 
 function checkRateLimit(clientIp: string): {
   allowed: boolean;
@@ -206,7 +238,7 @@ export async function POST(request: NextRequest) {
     let sanitizedHistory: { role: 'user' | 'model'; parts: [{ text: string }] }[] = [];
     if (Array.isArray(conversationHistory)) {
       sanitizedHistory = conversationHistory
-        .slice(-10) // Limit to last 10 messages
+        .slice(-6) // Keep enough conversational continuity without excess prompt latency
         .filter((msg): msg is { role: string; content: string } =>
           typeof msg === 'object' &&
           msg !== null &&
@@ -216,32 +248,45 @@ export async function POST(request: NextRequest) {
         )
         .map(msg => ({
           role: msg.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: msg.content.slice(0, 4000) }],
+          parts: [{ text: msg.content.slice(0, 1200) }],
         }));
     }
 
     // 3. Retrieve relevant context from curated dataset
-    const context = retrieveContext(trimmedMessage, 8);
+    const context = retrieveContext(trimmedMessage, 5);
     const contextText = formatContextForPrompt(context);
 
-    // 4. Candidate models with valid model identifiers
-    const candidateModels = Array.from(
-      new Set(
-        [
-          process.env.GEMINI_MODEL,
-          'gemini-flash-latest',
-          'gemini-flash-lite-latest',
-          'gemini-2.0-flash',
-          'gemini-1.5-flash',
-        ].filter(Boolean) as string[]
-      )
-    );
+    const cacheKey = JSON.stringify({
+      message: trimmedMessage.toLowerCase(),
+      history: sanitizedHistory.map(({ role, parts }) => [role, parts[0].text]),
+    });
+    const cached = responseCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return NextResponse.json(
+        { response: cached.response, sources: context.sources, retrievalNotes: context.relevanceNotes, cached: true },
+        { headers: rateLimitHeaders }
+      );
+    }
+
+    // 4. Discover models available to this key, then prefer a fast text model.
+    // This prevents a retired hard-coded fallback from breaking the Copilot.
+    const discoveredModels = await getAvailableModels(apiKey);
+    const preferredModels = [process.env.GEMINI_MODEL, ...STATIC_MODEL_FALLBACKS]
+      .filter(Boolean)
+      .map(model => normalizeModelName(model!));
+    const candidateModels = discoveredModels.length > 0
+      ? Array.from(new Set([
+          ...preferredModels.filter(model => discoveredModels.includes(model)),
+          ...discoveredModels,
+        ]))
+      : Array.from(new Set(preferredModels));
 
     const prompt = `${contextText}\n\n--- USER QUESTION ---\n${trimmedMessage}`;
 
     const genAI = new GoogleGenerativeAI(apiKey);
     let lastError: unknown = null;
     let text: string | null = null;
+    let allModelsUnavailable = candidateModels.length > 0;
 
     for (const modelName of candidateModels) {
       try {
@@ -251,21 +296,17 @@ export async function POST(request: NextRequest) {
         });
 
         const chat = model.startChat({
-          history: [
-            { role: 'user', parts: [{ text: 'You are the GCC Atlas Research Copilot. Acknowledge and follow these instructions.' }] },
-            { role: 'model', parts: [{ text: 'I understand. I am the GCC Atlas Research Copilot. I will follow all rules about citing sources, distinguishing verified facts from estimates and unknowns, and never inventing information.' }] },
-            ...sanitizedHistory,
-          ],
+          history: sanitizedHistory,
           generationConfig: {
             temperature: 0.3,
-            maxOutputTokens: 2048,
+            maxOutputTokens: 900,
           },
         });
 
         const result = await withTimeout(
           chat.sendMessage(prompt),
-          25000,
-          `Gemini request timed out after 25s for model ${modelName}`
+          18000,
+          `Gemini request timed out after 18s for model ${modelName}`
         );
         const response = result.response;
         text = response.text();
@@ -277,6 +318,10 @@ export async function POST(request: NextRequest) {
         const errMsg = err instanceof Error ? err.message : '';
         console.warn(`Gemini model ${modelName} encountered error:`, errMsg);
 
+        if (!/(404|not found|not supported)/i.test(errMsg)) {
+          allModelsUnavailable = false;
+        }
+
         if (errMsg.includes('API_KEY_INVALID') || errMsg.includes('PERMISSION_DENIED')) {
           throw err;
         }
@@ -284,8 +329,18 @@ export async function POST(request: NextRequest) {
     }
 
     if (!text) {
+      if (allModelsUnavailable) {
+        throw new Error('No compatible Gemini text model is available for this API key. Set GEMINI_MODEL to a currently available model from Google AI Studio.');
+      }
       throw lastError || new Error('All available Gemini models are currently busy. Please try again.');
     }
+
+    if (responseCache.size > 200) {
+      for (const [key, value] of responseCache) {
+        if (value.expiresAt <= Date.now()) responseCache.delete(key);
+      }
+    }
+    responseCache.set(cacheKey, { response: text, expiresAt: Date.now() + RESPONSE_CACHE_TTL_MS });
 
     return NextResponse.json(
       {

@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "vitest run"
+    "test": "vitest run",
+    "audit:links": "node scripts/audit-external-links.mjs"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",

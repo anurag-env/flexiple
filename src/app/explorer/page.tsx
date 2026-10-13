@@ -116,7 +116,23 @@ function CompanyDetail({ company, onClose }: { company: GCCCompany; onClose: () 
           )}
 
           <div className="border-t border-navy-100 pt-4">
-            <p className="text-xs font-medium text-navy-500 uppercase tracking-wide mb-3">Supporting Evidence</p>
+            {company.evidenceUrl && (
+              <div className="rounded-xl border border-accent-200 bg-accent-50/50 p-3.5 mb-4">
+                <p className="text-[11px] font-semibold text-accent-700 uppercase tracking-wide mb-1">Primary company evidence</p>
+                <a
+                  href={company.evidenceUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-sm text-accent-700 hover:text-accent-800 font-semibold"
+                >
+                  Open {company.companyName}&apos;s current India source <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+                <p className="mt-1 text-xs leading-relaxed text-navy-600">Use this first for company-specific location and hiring evidence. It opens in a new tab.</p>
+              </div>
+            )}
+
+            <p className="text-xs font-medium text-navy-500 uppercase tracking-wide mb-1">Additional market context</p>
+            <p className="text-xs text-navy-500 mb-3">These broader sources support ecosystem context; they are not company-specific proof.</p>
             {sources.length > 0 ? (
               <div className="space-y-3">
                 {sources.map(src => (
@@ -134,21 +150,14 @@ function CompanyDetail({ company, onClose }: { company: GCCCompany; onClose: () 
                     {src.publicationDate && (
                       <p className="text-xs text-navy-400 mt-0.5">Published: {src.publicationDate}</p>
                     )}
+                    {src.lastCheckedDate && (
+                      <p className="text-xs text-navy-400 mt-0.5">Link last checked: {src.lastCheckedDate}</p>
+                    )}
                   </div>
                 ))}
               </div>
             ) : (
-              <p className="text-sm text-navy-500">No direct sources linked — see evidence URL below.</p>
-            )}
-            {company.evidenceUrl && (
-              <a
-                href={company.evidenceUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 mt-3 text-sm text-accent-600 hover:text-accent-700 font-medium"
-              >
-                Primary evidence URL <ExternalLink className="w-3.5 h-3.5" />
-              </a>
+              <p className="text-sm text-navy-500">No additional context sources are linked for this record.</p>
             )}
           </div>
 
